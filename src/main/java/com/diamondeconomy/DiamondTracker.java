@@ -61,7 +61,7 @@ public final class DiamondTracker {
         }
 
         // Пока открыт сундук/инвентарь/торговля, ничего не фиксируем: ждём закрытия окна
-        if (mc.screen instanceof AbstractContainerScreen<?>) {
+        if (mc.gui.screen() instanceof AbstractContainerScreen<?>) {
             screenWasOpen = true;
             return;
         }
