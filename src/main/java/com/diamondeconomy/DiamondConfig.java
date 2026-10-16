@@ -21,6 +21,8 @@ public class DiamondConfig {
     public boolean showHud = true;
     public int hudX = 6;
     public int hudY = 6;
+    /** Размер панели слева сверху (меняется в режиме настройки, клавиша K по умолчанию). */
+    public float hudScale = 1.0f;
 
     // --- Тосты ---
     public boolean showToasts = true;
