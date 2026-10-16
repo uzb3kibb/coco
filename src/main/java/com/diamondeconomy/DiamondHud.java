@@ -3,12 +3,21 @@ package com.diamondeconomy;
 import net.minecraft.client.DeltaTracker;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.gui.GuiGraphicsExtractor;
+import net.minecraft.client.gui.components.Button;
+import net.minecraft.client.gui.screens.Screen;
+import net.minecraft.client.input.KeyEvent;
+import net.minecraft.client.input.MouseButtonEvent;
+import net.minecraft.network.chat.Component;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.Items;
+import org.lwjgl.glfw.GLFW;
+
+import java.util.IdentityHashMap;
 
 /**
  * HUD в стиле «матового стекла»: светлая полупрозрачная панель с крупным скруглением, тёмная
  * плашка-шапка с бейджем-числом, строки со слайдером (круглая белая ручка). Всё плавно анимируется.
+ * Панель слева сверху можно двигать и менять ей размер (клавиша K открывает режим настройки).
  */
 public final class DiamondHud {
     private static final int GREEN = 0xFF55FF55;
@@ -29,11 +38,21 @@ public final class DiamondHud {
     private static final int HEAD_H = 20;
     private static final int ROW_H = 28;
     private static final int FOOT_H = 14;
-    private static final long SLIDE_MS = 350;
+    private static final long SLIDE_MS = 420;
+
+    private static final float SCALE_MIN = 0.5f;
+    private static final float SCALE_MAX = 3.0f;
 
     private static ItemStack icon;
     private static ItemStack chestIcon;
     private static ItemStack enderIcon;
+
+    // ---- видно редактору: где сейчас панель на экране (с учётом масштаба) ----
+    /** true, пока открыт режим настройки: панель рисует сам редактор. */
+    public static volatile boolean editing = false;
+    public static int boundsX, boundsY, boundsW, boundsH;
+    /** Размер панели без масштаба. */
+    public static int baseW = 124, baseH = 60;
 
     // ---- состояние анимаций ----
     private static long lastNs = 0;
@@ -41,10 +60,14 @@ public final class DiamondHud {
     private static float slide = 0f;                       // появление панели 0..1
     private static float dispW = -1f;                      // размеры панели (плавно меняются)
     private static float dispH = -1f;
+    private static float dispX = -1f;                      // положение и масштаб (плавно следуют за настройками)
+    private static float dispY = -1f;
+    private static float dispScale = -1f;
     private static float rSum = -1f, rInv = -1f, rChest = -1f, rEnder = -1f; // «накручиваемые» числа
     private static float fInv = 0f, fChest = 0f, fEnder = 0f;                // положение слайдеров 0..1
     private static boolean hadChest = false;
     private static boolean hadEnder = false;
+    private static final IdentityHashMap<DiamondTracker.Toast, Float> toastY = new IdentityHashMap<>();
 
     private DiamondHud() {}
 
@@ -53,6 +76,9 @@ public final class DiamondHud {
         slide = 0f;
         dispW = -1f;
         dispH = -1f;
+        dispX = -1f;
+        dispY = -1f;
+        dispScale = -1f;
         rSum = -1f;
         rInv = -1f;
         rChest = -1f;
@@ -62,6 +88,15 @@ public final class DiamondHud {
         fEnder = 0f;
         hadChest = false;
         hadEnder = false;
+        toastY.clear();
+    }
+
+    private static void ensureIcons() {
+        if (icon == null) {
+            icon = new ItemStack(Items.DIAMOND);
+            chestIcon = new ItemStack(Items.CHEST);
+            enderIcon = new ItemStack(Items.ENDER_CHEST);
+        }
     }
 
     public static void render(GuiGraphicsExtractor g, DeltaTracker tickCounter) {
@@ -70,20 +105,26 @@ public final class DiamondHud {
             resetAnim();
             return;
         }
+        // время между кадрами для плавных анимаций (считаем один раз за кадр)
         long nowNs = System.nanoTime();
         dt = lastNs == 0 ? 0.016f : Math.min(0.1f, (nowNs - lastNs) / 1_000_000_000f);
         lastNs = nowNs;
 
         DiamondConfig cfg = DiamondConfig.get();
         long now = System.currentTimeMillis();
-        if (icon == null) {
-            icon = new ItemStack(Items.DIAMOND);
-            chestIcon = new ItemStack(Items.CHEST);
-            enderIcon = new ItemStack(Items.ENDER_CHEST);
-        }
+        ensureIcons();
 
-        if (cfg.showHud) drawCounter(g, mc, cfg, now);
+        // в режиме настройки панель рисует редактор поверх затемнения
+        if (cfg.showHud && !editing) drawCounter(g, mc, cfg, now);
         if (cfg.showToasts) drawToasts(g, mc, cfg, now);
+    }
+
+    /** Рисует счётчик из редактора (в тот же кадр, время уже обновлено в render). */
+    static void drawForEditor(GuiGraphicsExtractor g) {
+        Minecraft mc = Minecraft.getInstance();
+        if (mc.player == null) return;
+        ensureIcons();
+        drawCounter(g, mc, DiamondConfig.get(), System.currentTimeMillis());
     }
 
     // ------------------------------------------------------------ анимация
@@ -95,6 +136,10 @@ public final class DiamondHud {
 
     private static float snap(float v, float target) {
         return Math.abs(target - v) < 0.5f ? target : v;
+    }
+
+    private static float clamp(float v, float lo, float hi) {
+        return Math.max(lo, Math.min(hi, v));
     }
 
     /** «Накручивание» числа; первый кадр и большие скачки показываются сразу. */
@@ -111,6 +156,18 @@ public final class DiamondHud {
     private static float easeOut(float p) {
         float inv = 1f - p;
         return 1f - inv * inv * inv;
+    }
+
+    /** Мягкий «пружинистый» выезд: чуть проскакивает цель и возвращается. */
+    private static float easeOutBack(float p) {
+        float c1 = 1.70158f;
+        float c3 = c1 + 1f;
+        float t = p - 1f;
+        return 1f + c3 * t * t * t + c1 * t * t;
+    }
+
+    private static float smoothstep(float p) {
+        return p * p * (3f - 2f * p);
     }
 
     // ------------------------------------------------------------ примитивы
@@ -214,7 +271,7 @@ public final class DiamondHud {
         int x1 = x + w - 8;
         int trackW = x1 - x0;
         int ty = rowY + 22;
-        int fw = Math.round(trackW * Math.max(0f, Math.min(1f, frac)));
+        int fw = Math.round(trackW * clamp(frac, 0f, 1f));
 
         g.fill(x0, ty, x1, ty + 3, TRACK);
         if (fw > 0) g.fill(x0, ty, x0 + fw, ty + 3, accent);
@@ -291,18 +348,46 @@ public final class DiamondHud {
         dispW = snap(smooth(dispW, wT, 14f), wT);
         dispH = snap(smooth(dispH, hT, 14f), hT);
 
-        slide = Math.min(1f, slide + dt / 0.5f);
-        float ease = easeOut(slide);
+        // положение и масштаб плавно «догоняют» настройки (в том числе при перетаскивании)
+        float scTarget = clamp(cfg.hudScale, SCALE_MIN, SCALE_MAX);
+        if (dispScale < 0) {
+            dispScale = scTarget;
+            dispX = cfg.hudX;
+            dispY = cfg.hudY;
+        }
+        dispScale = smooth(dispScale, scTarget, 16f);
+        if (Math.abs(dispScale - scTarget) < 0.002f) dispScale = scTarget;
+        dispX = smooth(dispX, cfg.hudX, 22f);
+        if (Math.abs(dispX - cfg.hudX) < 0.25f) dispX = cfg.hudX;
+        dispY = smooth(dispY, cfg.hudY, 22f);
+        if (Math.abs(dispY - cfg.hudY) < 0.25f) dispY = cfg.hudY;
+
+        slide = Math.min(1f, slide + dt / 0.6f);
+        float ease = easeOutBack(slide);
 
         int w = Math.round(dispW);
         int h = Math.round(dispH);
-        int x = cfg.hudX - Math.round((w + 12) * (1f - ease)); // выезжает слева
-        int y = cfg.hudY;
+        int x = -Math.round((w + 12) * (1f - Math.min(1f, ease))); // локальная координата: выезжает слева
+        int y = 0;
+
+        // где панель на экране (нужно редактору)
+        baseW = w;
+        baseH = h;
+        boundsX = Math.round(dispX + x * dispScale);
+        boundsY = Math.round(dispY);
+        boundsW = Math.round(w * dispScale);
+        boundsH = Math.round(h * dispScale);
+
+        var pose = g.pose();
+        pose.pushMatrix();
+        pose.translate(dispX, dispY);
+        pose.scale(dispScale, dispScale);
 
         // шлейф за выезжающей панелью
         if (slide < 1f) {
+            float trail = 1f - Math.min(1f, easeOut(slide));
             for (int j = 3; j >= 1; j--) {
-                int a = (int) (0x30 * (1f - ease) * (4 - j) / 3f);
+                int a = (int) (0x30 * trail * (4 - j) / 3f);
                 if (a > 0) roundFill(g, x - j * 5, y, w, h, R, withAlpha(0xDDE4F0, a));
             }
         }
@@ -310,10 +395,11 @@ public final class DiamondHud {
         drawGlass(g, x, y, w, h, BORDER);
         drawHeader(g, mc, x, y, w, String.valueOf(Math.round(rSum)));
 
-        boolean flash = DiamondTracker.flashUntilMs > now;
+        // мигание при изменении суммы плавно затухает
+        float flashK = clamp((DiamondTracker.flashUntilMs - now) / 800f, 0f, 1f);
         int flashColor = DiamondTracker.flashDir > 0 ? GREEN : RED;
-        int invAccent = flash ? flashColor : ACCENT;
-        int invValue = flash ? flashColor : WHITE;
+        int invAccent = lerpColor(ACCENT, flashColor, flashK);
+        int invValue = lerpColor(WHITE, flashColor, flashK);
         int trackW = w - 16;
 
         int rowY = y + PAD + HEAD_H + 5;
@@ -340,6 +426,8 @@ public final class DiamondHud {
             roundFill(g, x + 8, rowY + 5, 4, 4, 2, ACCENT);
             g.text(mc.font, footerText, x + 16, rowY + 2, MUTED, true);
         }
+
+        pose.popMatrix();
     }
 
     // ------------------------------------------------------------------ тосты
@@ -354,6 +442,7 @@ public final class DiamondHud {
     private static void drawToasts(GuiGraphicsExtractor g, Minecraft mc, DiamondConfig cfg, long now) {
         long duration = cfg.toastDurationTicks * 50L;
         DiamondTracker.TOASTS.removeIf(t -> now - t.createdMs > duration);
+        toastY.keySet().retainAll(DiamondTracker.TOASTS);
 
         int screenW = mc.getWindow().getGuiScaledWidth();
         int w = 130;
@@ -363,20 +452,30 @@ public final class DiamondHud {
 
         for (DiamondTracker.Toast t : DiamondTracker.TOASTS) {
             long age = now - t.createdMs;
-            float in = Math.min(1f, age / (float) SLIDE_MS);
-            float out = Math.min(1f, (duration - age) / (float) SLIDE_MS);
-            float k = easeOut(Math.max(0f, Math.min(in, out)));
+            boolean entering = age < duration / 2;
+
+            // появление: мягкий выезд с лёгким «пружинением»; уход: плавное уезжание
+            float k;
+            if (entering) {
+                k = easeOutBack(Math.min(1f, age / (float) SLIDE_MS));
+            } else {
+                float outP = Math.min(1f, (duration - age) / (float) SLIDE_MS);
+                k = smoothstep(outP);
+            }
 
             int x = (screenW - w) / 2;
-            int targetY = 8 + index * (h + gap);
-            int y = (int) (targetY - (h + 16) * (1f - k));
+            float targetY = 8 + index * (h + gap);
+            Float cur = toastY.get(t);
+            float baseY = cur == null ? targetY : smooth(cur, targetY, 12f); // соседние плашки плавно съезжаются
+            toastY.put(t, baseY);
+            int y = Math.round(baseY - (h + 16) * (1f - k));
 
             boolean gain = t.delta > 0;
             int accent = gain ? GREEN : RED;
 
             // «motion blur»: пока плашка едет, за ней тянется затухающий шлейф
-            if (k < 1f) {
-                int dir = age < duration / 2 ? -1 : 1; // при появлении шлейф сверху, при уходе снизу
+            if (k < 0.98f) {
+                int dir = entering ? -1 : 1; // при появлении шлейф сверху, при уходе снизу
                 for (int j = 3; j >= 1; j--) {
                     int a = (int) (0x30 * (1f - k) * (4 - j) / 3f);
                     if (a > 0) roundFill(g, x, y + dir * j * 5, w, h, R, withAlpha(0xDDE4F0, a));
@@ -404,5 +503,164 @@ public final class DiamondHud {
         if (m10 == 1) return "алмаз";
         if (m10 >= 2 && m10 <= 4) return "алмаза";
         return "алмазов";
+    }
+
+    // ================================================================ редактор
+
+    /**
+     * Режим настройки панели (клавиша K): ЛКМ по панели и тяни, чтобы переместить;
+     * колесо мыши или правый нижний угол меняют размер; R сбрасывает; Esc или «Готово» сохраняют.
+     */
+    public static final class Editor extends Screen {
+        private enum Mode { NONE, MOVE, RESIZE }
+
+        private Mode mode = Mode.NONE;
+        private double grabX;
+        private double grabY;
+
+        public Editor() {
+            super(Component.literal("Diamond HUD"));
+        }
+
+        @Override
+        protected void init() {
+            editing = true;
+            int cx = this.width / 2;
+            int y = this.height - 32;
+            addRenderableWidget(Button.builder(Component.literal("Сбросить"), b -> reset())
+                    .bounds(cx - 104, y, 100, 20).build());
+            addRenderableWidget(Button.builder(Component.literal("Готово"), b -> onClose())
+                    .bounds(cx + 4, y, 100, 20).build());
+        }
+
+        @Override
+        public void removed() {
+            editing = false;
+            DiamondConfig.save();
+        }
+
+        @Override
+        public boolean isPauseScreen() {
+            return false;
+        }
+
+        private void reset() {
+            DiamondConfig cfg = DiamondConfig.get();
+            cfg.hudX = 6;
+            cfg.hudY = 6;
+            cfg.hudScale = 1.0f;
+            DiamondConfig.save();
+        }
+
+        private boolean inside(int mx, int my) {
+            return mx >= boundsX - 3 && mx <= boundsX + boundsW + 3 && my >= boundsY - 3 && my <= boundsY + boundsH + 3;
+        }
+
+        private boolean overHandle(int mx, int my) {
+            int hs = 12;
+            return mx >= boundsX + boundsW - hs && mx <= boundsX + boundsW + 4
+                    && my >= boundsY + boundsH - hs && my <= boundsY + boundsH + 4;
+        }
+
+        @Override
+        public void extractRenderState(GuiGraphicsExtractor g, int mouseX, int mouseY, float delta) {
+            super.extractRenderState(g, mouseX, mouseY, delta);
+
+            // сама панель рисуется поверх затемнения, чтобы была чёткой
+            drawForEditor(g);
+
+            int x = boundsX;
+            int y = boundsY;
+            int w = boundsW;
+            int h = boundsH;
+            boolean active = mode != Mode.NONE || inside(mouseX, mouseY);
+            int c = active ? 0xFF4DD0E1 : 0x884DD0E1;
+
+            // рамка вокруг панели
+            g.fill(x - 3, y - 3, x + w + 3, y - 2, c);
+            g.fill(x - 3, y + h + 2, x + w + 3, y + h + 3, c);
+            g.fill(x - 3, y - 2, x - 2, y + h + 2, c);
+            g.fill(x + w + 2, y - 2, x + w + 3, y + h + 2, c);
+
+            // ручка изменения размера в правом нижнем углу
+            boolean hot = mode == Mode.RESIZE || overHandle(mouseX, mouseY);
+            int hx = x + w - 4;
+            int hy = y + h - 4;
+            g.fill(hx, hy, hx + 9, hy + 9, hot ? 0xFFFFFFFF : 0xCCFFFFFF);
+            g.fill(hx + 2, hy + 2, hx + 7, hy + 7, 0xFF4DD0E1);
+
+            // подсказки
+            DiamondConfig cfg = DiamondConfig.get();
+            String l1 = "ЛКМ: перетащить панель  ·  колесо мыши или правый нижний угол: размер  ·  R: сброс";
+            String l2 = "Размер: " + Math.round(cfg.hudScale * 100f) + "%   ·   Esc или «Готово»: сохранить";
+            g.text(this.font, l1, (this.width - this.font.width(l1)) / 2, 12, 0xFFFFFFFF, true);
+            g.text(this.font, l2, (this.width - this.font.width(l2)) / 2, 25, 0xFFD3D9E2, true);
+        }
+
+        @Override
+        public boolean mouseClicked(MouseButtonEvent event, boolean doubleClick) {
+            if (event.button() == 0) {
+                int mx = (int) event.x();
+                int my = (int) event.y();
+                DiamondConfig cfg = DiamondConfig.get();
+                if (overHandle(mx, my)) {
+                    mode = Mode.RESIZE;
+                    return true;
+                }
+                if (inside(mx, my)) {
+                    mode = Mode.MOVE;
+                    grabX = mx - cfg.hudX;
+                    grabY = my - cfg.hudY;
+                    return true;
+                }
+            }
+            return super.mouseClicked(event, doubleClick);
+        }
+
+        @Override
+        public boolean mouseDragged(MouseButtonEvent event, double dragX, double dragY) {
+            DiamondConfig cfg = DiamondConfig.get();
+            if (mode == Mode.MOVE) {
+                int nx = (int) Math.round(event.x() - grabX);
+                int ny = (int) Math.round(event.y() - grabY);
+                cfg.hudX = Math.max(0, Math.min(nx, Math.max(0, this.width - boundsW)));
+                cfg.hudY = Math.max(0, Math.min(ny, Math.max(0, this.height - boundsH)));
+                return true;
+            }
+            if (mode == Mode.RESIZE) {
+                float sx = (float) ((event.x() - cfg.hudX) / Math.max(1, baseW));
+                float sy = (float) ((event.y() - cfg.hudY) / Math.max(1, baseH));
+                cfg.hudScale = clamp(Math.max(sx, sy), SCALE_MIN, SCALE_MAX);
+                return true;
+            }
+            return super.mouseDragged(event, dragX, dragY);
+        }
+
+        @Override
+        public boolean mouseReleased(MouseButtonEvent event) {
+            if (mode != Mode.NONE) {
+                mode = Mode.NONE;
+                DiamondConfig.save();
+                return true;
+            }
+            return super.mouseReleased(event);
+        }
+
+        @Override
+        public boolean mouseScrolled(double mouseX, double mouseY, double scrollX, double scrollY) {
+            DiamondConfig cfg = DiamondConfig.get();
+            float s = cfg.hudScale + (float) scrollY * 0.08f;
+            cfg.hudScale = Math.round(clamp(s, SCALE_MIN, SCALE_MAX) * 100f) / 100f;
+            return true;
+        }
+
+        @Override
+        public boolean keyPressed(KeyEvent event) {
+            if (event.key() == GLFW.GLFW_KEY_R) {
+                reset();
+                return true;
+            }
+            return super.keyPressed(event);
+        }
     }
 }
